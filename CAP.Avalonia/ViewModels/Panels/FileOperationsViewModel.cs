@@ -32,6 +32,7 @@ public partial class FileOperationsViewModel : ObservableObject
     private readonly ObservableCollection<ComponentTemplate> _componentLibrary;
     private readonly ErrorConsoleService? _errorConsole;
     private readonly UserSMatrixOverrideStore? _userSMatrixOverrideStore;
+    private readonly IUrlLauncher _urlLauncher;
 
     /// <summary>
     /// Current .lun format version this build reads and writes. Files with any other value are rejected at load time.
@@ -111,6 +112,12 @@ public partial class FileOperationsViewModel : ObservableObject
     /// </summary>
     public IMessageBoxService? MessageBoxService { get; set; }
 
+    /// <summary>
+    /// Opens the Settings window, optionally pre-selecting a page by type.
+    /// Wired by <see cref="MainViewModel"/>; null in headless contexts.
+    /// </summary>
+    public Func<Type?, Task>? ShowSettingsWindow { get; set; }
+
     /// <summary>Initializes a new instance of <see cref="FileOperationsViewModel"/>.</summary>
     public FileOperationsViewModel(
         DesignCanvasViewModel canvas,
@@ -122,7 +129,8 @@ public partial class FileOperationsViewModel : ObservableObject
         PhotonTorchExportViewModel photonTorchExport,
         VerilogAExportViewModel verilogAExport,
         ErrorConsoleService? errorConsole = null,
-        UserSMatrixOverrideStore? userSMatrixOverrideStore = null)
+        UserSMatrixOverrideStore? userSMatrixOverrideStore = null,
+        IUrlLauncher? urlLauncher = null)
     {
         _canvas = canvas;
         _commandManager = commandManager;
@@ -134,6 +142,7 @@ public partial class FileOperationsViewModel : ObservableObject
         VerilogAExport = verilogAExport;
         _errorConsole = errorConsole;
         _userSMatrixOverrideStore = userSMatrixOverrideStore;
+        _urlLauncher = urlLauncher ?? PlatformShellLauncher.CreateDefault();
 
         // Track changes to mark project as unsaved
         _canvas.Components.CollectionChanged += (s, e) => HasUnsavedChanges = true;
@@ -169,6 +178,7 @@ public partial class FileOperationsViewModel : ObservableObject
                 addedComponents,
                 StoredSMatrices,
                 templateKeyResolver: ResolveTemplateKey,
+                geometryKeyResolver: ResolveGeometryKey,
                 errorConsole: _errorConsole,
                 keyMatchesKnownTemplate: KeyMatchesKnownLibraryTemplate);
         }
@@ -308,7 +318,17 @@ public partial class FileOperationsViewModel : ObservableObject
             designData.FormatVersion = CurrentFormatVersion;
             designData.Metadata = BuildMetadataForSave();
             if (StoredSMatrices.Count > 0)
-                designData.SMatrices = new Dictionary<string, ComponentSMatrixData>(StoredSMatrices);
+            {
+                // Drop overrides orphaned by a parameter/geometry change before persisting:
+                // keep only entries still reachable from a placed component (by geometry key
+                // or legacy Identifier) plus template-scoped ("::") user-global entries.
+                var live = _canvas.Components.Select(vm => vm.Component).ToList();
+                var usedGeometryKeys = live.Select(ResolveGeometryKey).ToHashSet();
+                var liveIdentifiers = live.Select(c => c.Identifier).ToHashSet();
+                var swept = Services.SMatrixOverrideGc.Sweep(StoredSMatrices, usedGeometryKeys, liveIdentifiers);
+                if (swept.Count > 0)
+                    designData.SMatrices = swept;
+            }
             if (StoredNazcaOverrides.Count > 0)
                 designData.NazcaOverrides = new Dictionary<string, CAP_DataAccess.Persistence.PIR.NazcaCodeOverride>(StoredNazcaOverrides);
             designData.ChipWidthMicrometers  = _canvas.ChipMaxX;
@@ -375,6 +395,17 @@ public partial class FileOperationsViewModel : ObservableObject
         var templateName = FindTemplateName(component);
         return $"{pdkSource}::{templateName}";
     }
+
+    /// <summary>
+    /// Builds the geometry-scoped override-store key for a component, so that an
+    /// override imported under a geometry key (FDTD / S-parameter import) re-applies
+    /// to every placed instance and copy sharing that geometry. Threads the live
+    /// raw-code override (if any) through <see cref="Services.ComponentGeometryKey.For"/>.
+    /// </summary>
+    private string ResolveGeometryKey(Component component) =>
+        CAP.Avalonia.Services.ComponentGeometryKey.For(
+            component,
+            c => StoredNazcaOverrides.TryGetValue(c.Identifier, out var o) ? o.RawCode : null);
 
     /// <summary>
     /// Returns true when the given override-store key (shape
@@ -769,6 +800,7 @@ public partial class FileOperationsViewModel : ObservableObject
                         allComponents,
                         StoredSMatrices,
                         templateKeyResolver: ResolveTemplateKey,
+                        geometryKeyResolver: ResolveGeometryKey,
                         errorConsole: _errorConsole,
                         keyMatchesKnownTemplate: KeyMatchesKnownLibraryTemplate,
                         reportOrphans: true);
@@ -1245,11 +1277,37 @@ public partial class FileOperationsViewModel : ObservableObject
 
         if (filePath != null)
         {
+            // A script named like a Python module it imports (e.g. re.py, numpy.py)
+            // shadows that module and fails with a cryptic circular-import error —
+            // refuse the name up front instead of letting the Nazca run explode.
+            var stem = Path.GetFileNameWithoutExtension(filePath);
+            if (PythonModuleShadowing.ShadowsPythonModule(stem))
+            {
+                var warning = $"'{Path.GetFileName(filePath)}' shadows the Python module '{stem.ToLowerInvariant()}' "
+                    + "— the exported script could not import Nazca. Please choose a different file name (e.g. chip1.py).";
+                if (MessageBoxService != null)
+                    await MessageBoxService.ShowChoicePromptAsync(warning, "Invalid script name", new[] { "OK" });
+                UpdateStatus?.Invoke(warning);
+                return;
+            }
+
             try
             {
                 // Export Python script
                 var nazcaCode = _nazcaExporter.Export(_canvas, overrides: StoredNazcaOverrides);
                 await File.WriteAllTextAsync(filePath, nazcaCode);
+
+                // GDS pre-flight: refresh a stale "not ready" verdict once, then ask the
+                // user how to proceed when Nazca is genuinely unavailable.
+                if (GdsExport.GenerateGdsEnabled && !GdsExport.IsEnvironmentReady)
+                    await GdsExport.CheckEnvironmentAsync();
+
+                var decision = await GdsExport.PreflightGdsAsync(MessageBoxService);
+                if (decision != Export.GdsPreflightDecision.Proceed)
+                {
+                    await HandleSkippedGdsAsync(decision, filePath);
+                    return;
+                }
 
                 // Attempt GDS generation if enabled
                 var result = await GdsExport.ExportScriptToGdsAsync(filePath);
@@ -1280,6 +1338,29 @@ public partial class FileOperationsViewModel : ObservableObject
                 UpdateStatus?.Invoke($"Export failed: {ex.Message}");
             }
         }
+    }
+
+    /// <summary>
+    /// Handles the non-Proceed pre-flight outcomes: the Nazca script is already on disk,
+    /// only the GDS step is skipped. Install/settings choices open the Settings window on
+    /// the Python-Environments page (the install progress is visible there).
+    /// </summary>
+    private async Task HandleSkippedGdsAsync(Export.GdsPreflightDecision decision, string scriptPath)
+    {
+        if (decision == Export.GdsPreflightDecision.InstallRequested)
+        {
+            GdsExport.InstallNazcaCommand.Execute(null);
+            if (ShowSettingsWindow != null)
+                await ShowSettingsWindow(typeof(Settings.PythonEnvironmentsSettingsPage));
+            UpdateStatus?.Invoke($"Exported {Path.GetFileName(scriptPath)} — GDS skipped (installing Nazca)");
+            return;
+        }
+
+        if (decision == Export.GdsPreflightDecision.OpenSettingsRequested
+            && ShowSettingsWindow != null)
+            await ShowSettingsWindow(typeof(Settings.PythonEnvironmentsSettingsPage));
+
+        UpdateStatus?.Invoke($"Exported {Path.GetFileName(scriptPath)} — GDS skipped (Nazca not available)");
     }
 
     /// <summary>
@@ -1364,18 +1445,11 @@ public partial class FileOperationsViewModel : ObservableObject
             if (!File.Exists(filePath))
                 return;
 
-            // Try to open with default application first; on systems without a registered
-            // handler Process.Start raises Win32Exception. Fall back to selecting the file
-            // in the system file manager so the user can still locate the export.
+            // Open with the default application via the platform launcher.
+            // Falls back to revealing in the file manager if no handler is registered.
             try
             {
-                var startInfo = new System.Diagnostics.ProcessStartInfo
-                {
-                    FileName = filePath,
-                    UseShellExecute = true
-                };
-
-                System.Diagnostics.Process.Start(startInfo);
+                _urlLauncher.OpenFileOrDirectory(filePath);
             }
             catch (System.ComponentModel.Win32Exception ex)
             {
@@ -1390,41 +1464,16 @@ public partial class FileOperationsViewModel : ObservableObject
     }
 
     /// <summary>
-    /// Opens the file explorer and selects the specified file.
-    /// Works cross-platform (Windows, Linux, macOS).
+    /// Reveals the specified file in the system file manager.
+    /// Works cross-platform via <see cref="IUrlLauncher.RevealInFileManager"/>.
     /// </summary>
-    /// <param name="filePath">Path to the file to select.</param>
+    /// <param name="filePath">Path to the file to reveal.</param>
     private void OpenFileExplorer(string filePath)
     {
         try
         {
             var absolutePath = Path.GetFullPath(filePath);
-
-            if (OperatingSystem.IsWindows())
-            {
-                // Windows: explorer.exe /select,"path"
-                System.Diagnostics.Process.Start("explorer.exe", $"/select,\"{absolutePath}\"");
-            }
-            else if (OperatingSystem.IsLinux())
-            {
-                // Linux: Try xdg-open on the directory
-                var directory = Path.GetDirectoryName(absolutePath);
-                if (directory != null)
-                {
-                    var startInfo = new System.Diagnostics.ProcessStartInfo
-                    {
-                        FileName = "xdg-open",
-                        Arguments = $"\"{directory}\"",
-                        UseShellExecute = true
-                    };
-                    System.Diagnostics.Process.Start(startInfo);
-                }
-            }
-            else if (OperatingSystem.IsMacOS())
-            {
-                // macOS: open -R "path"
-                System.Diagnostics.Process.Start("open", $"-R \"{absolutePath}\"");
-            }
+            _urlLauncher.RevealInFileManager(absolutePath);
         }
         catch (Exception ex)
         {
